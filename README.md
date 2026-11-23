@@ -81,6 +81,67 @@ it), `kept_version`, `kept_locks` and `kept_download_url`.
 
 Stale versions return `409`; versions never published return `404`.
 
+### `POST /api/packages/{id}/versions/{v}/pages/{n}/ghost-check` (multipart/form-data)
+
+Afterimage (残影) verification for a guide screen whose image was replaced.
+All uploaded PNGs must be the same size as the currently rendered page and
+pixel-aligned with it; Pillow converts every image to 8-bit grayscale.
+
+| field | meaning |
+| --- | --- |
+| `old_image` | one PNG actually delivered to the screen in the previous round |
+| `photos` | 1–2 grayscale screen-photograph PNGs (RGB photos are accepted and converted) |
+
+The service marks **2–8 calibration points** where old and new grayscales
+agree, spanning at least two grayscale values, and circles one **region of
+interest (ROI)** of at most 16×16 pixels that contains grayscale variation
+and at least one pixel whose old and new grayscales differ.
+
+Each photograph gets its own exposure gain `a` (clamped to `0.5–2`) and
+offset `b`; every photograph shares one residual ratio `r` in `0–1`.  At
+every calibration point and every ROI pixel the photograph grayscale must
+match
+
+```
+a * (new_gray + r * (old_gray - new_gray)) + b
+```
+
+within a tolerance of 2 grayscale levels.  For a fixed `r` each observation
+is a pair of affine half-planes in `(a, b)`; feasibility is solved as a
+two-variable linear program by minimising the convex bound gap, and the
+feasible `r` values form a closed interval, recovered with golden-section
+and bisection searches (no third-party solver).
+
+The response carries `decision` plus the shared interval and per-photo
+fits:
+
+| decision | rule |
+| --- | --- |
+| `reflash` | every feasible `r` is at least the 20% threshold |
+| `no_reflash` | every feasible `r` is below the 20% threshold |
+| `reshoot` | the interval straddles 20%, so another photograph is needed |
+
+Two conflict responses use `409`: `evidence_conflict` when the photographs
+admit no common `(a, b, r)` explanation (each photo's own interval is
+included for the inspector), and `version_conflict` when `v` is not the
+current version.  Bad sizes, photo counts or pages without measurable
+grayscale changes return `422`/`404` using the standard error envelope.
+
+```jsonc
+{
+  "package_id": "…", "version": 1, "page": 1,
+  "decision": "reshoot",
+  "reflash_threshold": 0.2, "tolerance": 2.0,
+  "residual_ratio": {"min": 0.0847, "max": 0.2133},
+  "calibration_points": [{"x": 0, "y": 6, "gray": 0}, /* 2–8 points, ≥2 grays */],
+  "region_of_interest": {"x": 8, "y": 8, "width": 16, "height": 16,
+                         "changed_pixels": 256, "gray_levels": 2},
+  "photos": [{"photo": 1, "gain_a": 0.9998, "offset_b": 0.0314,
+              "residual_ratio_interval": {"min": 0.0847, "max": 0.2133},
+              "max_abs_residual": 0.0314}]
+}
+```
+
 ## Demo: lock causes a cross-page colour change
 
 ```bash
@@ -95,6 +156,27 @@ to the ochre colour, because those labels touch on every page where both
 appear. It then requests an impossible lock (rule and seal both blue while
 touching), shows the `409` with preserved version/locks, and shows a stale
 version download returning `409`.
+
+## Demo: afterimage check changes verdict after a second photograph
+
+```bash
+python3 demo/make_ghost_demo.py            # writes demo/out/ghost/*.png
+docker compose up --build                  # in another terminal
+bash demo/request_ghost_demo.sh            # BASE=... to target another host
+```
+
+The synthesised 32×32 page is published, then the previous-round PNG and
+screen photographs built from the physical model are submitted:
+
+1. one weak-contrast photograph whose feasible residual interval straddles
+   20% → `reshoot` (补拍);
+2. the same request plus a second, differently exposed photograph → the
+   common interval falls fully below 20% and the verdict changes to
+   `no_reflash` (无需重刷);
+3. one strongly ghosted photograph alone → `reflash` (建议重刷);
+4. two mutually incompatible photographs → `409 evidence_conflict`;
+5. after a lock bumps the version, the same call on the stale version →
+   `409 version_conflict`.
 
 ## Solver
 

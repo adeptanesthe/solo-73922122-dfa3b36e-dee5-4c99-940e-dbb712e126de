@@ -19,6 +19,8 @@ MAX_LABELS = 12
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MIN_PALETTE_COLORS = 2
 MAX_PALETTE_COLORS = 6
+MIN_GHOST_PHOTOS = 1
+MAX_GHOST_PHOTOS = 2
 
 _HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
@@ -87,6 +89,36 @@ def load_page(
         rgb_name=rgb_name,
         label_name=label_name,
     )
+
+
+def load_gray_png(
+    data: bytes, filename: str, expected_size: tuple[int, int] | None = None
+) -> tuple[int, int, bytes]:
+    """Decode a PNG and return its 8-bit grayscale bytes (Pillow ``L`` mode).
+
+    Grayscale screen photographs may be uploaded in any Pillow mode; they are
+    converted with the standard luma transform.  When ``expected_size`` is
+    given, the image must match it exactly, because the afterimage check relies
+    on pixel-for-pixel alignment with the published page.
+    """
+    image = _open_png(data, filename)
+    if image.mode != "L":
+        image = image.convert("L")
+    if expected_size is not None and image.size != expected_size:
+        raise InputError(
+            f"{filename}: size {image.width}x{image.height} does not match the "
+            f"current page size {expected_size[0]}x{expected_size[1]}; all images "
+            "must be equally sized and aligned"
+        )
+    return image.width, image.height, image.tobytes()
+
+
+def png_gray_bytes(width: int, height: int, gray: bytes) -> bytes:
+    """Encode raw 8-bit grayscale bytes as a PNG."""
+    image = Image.frombytes("L", (width, height), gray)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", compress_level=6)
+    return buffer.getvalue()
 
 
 def parse_palette(raw: str) -> list[RGB]:

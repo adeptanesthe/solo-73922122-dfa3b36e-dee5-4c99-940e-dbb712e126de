@@ -12,15 +12,23 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .imaging import (
+    MAX_GHOST_PHOTOS,
     MAX_PAGES,
     MAX_UPLOAD_BYTES,
     InputError,
+    load_gray_png,
     load_page,
     parse_lock_colour,
     parse_min_distance,
     parse_palette,
 )
 from .pipeline import analyse_pages
+from .ghost import (
+    GRAY_TOLERANCE,
+    REFLASH_THRESHOLD,
+    EvidenceConflictError,
+    verify_afterimage,
+)
 from .store import (
     InfeasibleError,
     NotFoundError,
@@ -305,6 +313,133 @@ def download_page(package_id: str, version: int, page: int):
         media_type="image/png",
         headers={"X-Package-Version": str(bundle.number)},
     )
+
+
+@app.post(
+    "/api/packages/{package_id}/versions/{version}/pages/{page}/ghost-check"
+)
+async def ghost_check(
+    package_id: str,
+    version: int,
+    page: int,
+    old_image: UploadFile = File(  # noqa: B008 - FastAPI dependency style
+        ..., description="PNG actually delivered in the previous round"
+    ),
+    photos: list[UploadFile] = File(  # noqa: B008 - FastAPI dependency style
+        ..., description="1-2 grayscale screen-photograph PNGs"
+    ),
+):
+    try:
+        package = store.get(package_id)
+    except NotFoundError:
+        return _error(404, "package_not_found", "no such package")
+    try:
+        with package.lock:
+            # Resolve the bundle first so stale or unknown versions are
+            # reported exactly like every other versioned endpoint.
+            bundle = store.get_bundle(package_id, version)
+            if not 1 <= page <= len(package.pages):
+                return _error(
+                    404,
+                    "page_not_found",
+                    f"page {page} does not exist; this package has "
+                    f"{len(package.pages)} page(s)",
+                )
+            source_page = package.pages[page - 1]
+            size = (source_page.width, source_page.height)
+
+            old_name = old_image.filename or "old image"
+            _, _, old_gray = load_gray_png(
+                await _read_upload(old_image, old_name), old_name, size
+            )
+            # The current rendered output is the "new" image; take its
+            # grayscale so old/new/photographs share one luma convention.
+            new_gray = load_gray_png(
+                bundle.pages_png[page - 1], f"current page {page}", size
+            )[2]
+
+            if not 1 <= len(photos) <= MAX_GHOST_PHOTOS:
+                raise InputError(
+                    f"submit between 1 and {MAX_GHOST_PHOTOS} screen photographs, "
+                    f"got {len(photos)}"
+                )
+            photo_grays = []
+            for index, upload in enumerate(photos, start=1):
+                name = upload.filename or f"photograph {index}"
+                _, _, gray = load_gray_png(
+                    await _read_upload(upload, name), name, size
+                )
+                photo_grays.append(gray)
+
+            verdict = await run_in_threadpool(
+                verify_afterimage,
+                size[0],
+                size[1],
+                new_gray,
+                old_gray,
+                photo_grays,
+            )
+    except VersionNotFoundError as exc:
+        return _error(404, "version_not_found", str(exc))
+    except VersionConflictError as exc:
+        return _error(
+            409,
+            "version_conflict",
+            str(exc),
+            current_version=exc.current_version,
+            current_download_url=(
+                f"/api/packages/{package_id}/versions/{exc.current_version}/download"
+            ),
+        )
+    except InputError as exc:
+        return _error(422, "invalid_input", str(exc))
+    except EvidenceConflictError as exc:
+        return _error(
+            409,
+            "evidence_conflict",
+            str(exc),
+            photo_intervals=exc.photo_intervals,
+            tolerance=GRAY_TOLERANCE,
+            gain_range=[0.5, 2.0],
+        )
+
+    return {
+        "package_id": package_id,
+        "version": version,
+        "page": page,
+        "decision": verdict.decision,
+        "reflash_threshold": REFLASH_THRESHOLD,
+        "tolerance": GRAY_TOLERANCE,
+        "residual_ratio": {
+            "min": verdict.r_min,
+            "max": verdict.r_max,
+        },
+        "calibration_points": [
+            {"x": point.x, "y": point.y, "gray": point.gray}
+            for point in verdict.calibration_points
+        ],
+        "region_of_interest": {
+            "x": verdict.roi.x,
+            "y": verdict.roi.y,
+            "width": verdict.roi.width,
+            "height": verdict.roi.height,
+            "changed_pixels": verdict.roi.changed_pixels,
+            "gray_levels": verdict.roi.gray_levels,
+        },
+        "photos": [
+            {
+                "photo": fit.index,
+                "gain_a": fit.gain_a,
+                "offset_b": fit.offset_b,
+                "residual_ratio_interval": {
+                    "min": fit.r_min,
+                    "max": fit.r_max,
+                },
+                "max_abs_residual": fit.max_abs_residual,
+            }
+            for fit in verdict.photos
+        ],
+    }
 
 
 @app.exception_handler(RequestValidationError)
