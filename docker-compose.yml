@@ -1,0 +1,9 @@
+services:
+  colouring-api:
+    build: .
+    image: epaper-colouring-api:local
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      PYTHONUNBUFFERED: "1"
